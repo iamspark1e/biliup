@@ -23,7 +23,8 @@ class Bilibili:
         'accept-language': 'zh-CN,zh;q=0.8,en-US;q=0.5,en;q=0.3',
         'user-agent': random_user_agent(),
         'origin': 'https://live.bilibili.com',
-        'referer': 'https://live.bilibili.com'
+        'referer': 'https://live.bilibili.com',
+        'cookie': ""
     }
 
     @staticmethod
@@ -31,10 +32,22 @@ class Bilibili:
 
         uid = content['uid']
         # 传入内容中，如果 uid 不为 0，则 cookie 必然存在，且必然为详细模式
-        if uid > 0:
-            Bilibili.headers['cookie'] = content['cookie']
-        else:
-            Bilibili.headers['cookie'] = ""
+        # if uid > 0:
+        #     Bilibili.headers['cookie'] = content['cookie']
+        # else:
+        #     Bilibili.headers['cookie'] = ""
+        # 默认存在风控Cookie
+        if content.get('cookie'):
+            if isinstance(content.get('cookie'), dict):
+                # dict 模式，拼接成字符串
+                Bilibili.headers['cookie'] = ''
+                for k, v in content['cookie'].items():
+                    Bilibili.headers['cookie'] += f"{k}={v};"
+            elif isinstance(content.get('cookie'), str):
+                # 原始字符串形式，直接使用
+                Bilibili.headers['cookie'] = content['cookie']
+            else:
+                Bilibili.headers['cookie'] = ''
 
         # 获取弹幕认证信息
         danmu_wss_url = 'wss://broadcastlv.chat.bilibili.com/sub'
@@ -52,7 +65,7 @@ class Bilibili:
                 'web_location': '444.8'
             }
             wbi.sign(params)
-            async with session.get(f"https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo",params=params,
+            async with session.get(f"https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo",headers=Bilibili.headers,params=params,
                                    timeout=5) as resp:
                 danmu_info = await resp.json()
                 danmu_token = danmu_info['data']['token']
