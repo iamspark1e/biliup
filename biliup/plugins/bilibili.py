@@ -2,6 +2,7 @@ import time
 import json
 import re
 import asyncio
+from typing import Optional, Dict, Any
 
 from biliup.common.util import client
 from biliup.config import config
@@ -41,9 +42,16 @@ class Bililive(DownloadBase):
         self.bili_normalize_cn204 = config.get('bili_normalize_cn204', False)
         self.cn01_sids = config.get('bili_replace_cn01', [])
         self.bili_cdn_fallback = config.get('bili_cdn_fallback', False)
+        
+        # 新增: 直播状态监控相关配置
+        self.status_check_interval = config.get('bili_status_check_interval', 30)  # 状态检查间隔(秒)
+        self.max_offline_count = config.get('bili_max_offline_count', 3)  # 最大连续离线检测次数
+        self._offline_count = 0  # 当前连续离线次数
+        self._status_check_task = None  # 状态检查任务
+        self._should_stop_download = False  # 是否应该停止下载
+        self._last_status_check = 0  # 上次状态检查时间
 
     async def acheck_stream(self, is_check=False):
-
         if "b23.tv" in self.url:
             try:
                 resp = await client.get(self.url, follow_redirects=False)
@@ -76,36 +84,23 @@ class Bililive(DownloadBase):
             await self.update_wbi()
 
         # 获取直播状态与房间标题
-        try:
-            params = {
-                "room_id": room_id,
-                "web_location": WBI_WEB_LOCATION,
-            }
-            wbi.sign(params)
-            room_info = await client.get(
-                f"{OFFICIAL_API}/xlive/web-room/v1/index/getInfoByRoom",
-                params=params,
-                headers=self.fake_headers)
-            room_info.raise_for_status()
-            room_info = room_info.json()
-        except Exception as e:
-            logger.error(f"{self.plugin_msg}: {e}", exc_info=True)
+        live_status = await self._check_live_status(room_id)
+        if live_status is None:
             return False
-        if room_info['code'] != 0:
-            logger.error(f"{self.plugin_msg}: {room_info}")
-            return False
-        else:
-            room_info = room_info['data']
-        if room_info['room_info']['live_status'] != 1:
+        
+        if not live_status['is_live']:
             logger.debug(f"{self.plugin_msg}: 未开播")
             self.raw_stream_url = None
             return False
 
-        self.live_cover_url = room_info['room_info']['cover']
-        self.room_title = room_info['room_info']['title']
-        self.__real_room_id = room_info['room_info']['room_id']
-        live_start_time = room_info['room_info']['live_start_time']
-        special_type = room_info['room_info']['special_type'] # 0: 公开直播, 1: 大航海专属
+        # 更新房间信息
+        room_info = live_status['room_info']
+        self.live_cover_url = room_info['cover']
+        self.room_title = room_info['title']
+        self.__real_room_id = room_info['room_id']
+        live_start_time = room_info['live_start_time']
+        special_type = room_info['special_type']
+        
         if live_start_time > self.live_start_time:
             self.live_start_time = live_start_time
             is_new_live = True
@@ -116,6 +111,12 @@ class Bililive(DownloadBase):
             return True
         else:
             self.__login_mid = await self.check_login_status()
+
+        # 启动状态监控任务
+        if not self._status_check_task or self._status_check_task.done():
+            self._should_stop_download = False
+            self._offline_count = 0
+            self._status_check_task = asyncio.create_task(self._monitor_live_status(room_id))
 
         # 复用原画 m3u8 流
         if  self.raw_stream_url is not None \
@@ -128,7 +129,6 @@ class Bililive(DownloadBase):
                 return True
             else:
                 self.raw_stream_url = None
-
 
         stream_urls = await self.aget_stream(self.bili_qn, self.bili_protocol, special_type)
         if not stream_urls:
@@ -219,6 +219,141 @@ class Bililive(DownloadBase):
 
         return True
 
+    async def _check_live_status(self, room_id: str) -> Optional[Dict[str, Any]]:
+        """
+        检查直播状态
+        :param room_id: 房间ID
+        :return: 直播状态信息，包含 is_live 和 room_info
+        """
+        try:
+            params = {
+                "room_id": room_id,
+                "web_location": WBI_WEB_LOCATION,
+            }
+            wbi.sign(params)
+            room_info = await client.get(
+                f"{OFFICIAL_API}/xlive/web-room/v1/index/getInfoByRoom",
+                params=params,
+                headers=self.fake_headers,
+                timeout=10  # 添加超时
+            )
+            room_info.raise_for_status()
+            room_info = room_info.json()
+            
+            if room_info['code'] != 0:
+                logger.error(f"{self.plugin_msg}: 状态检查失败 {room_info}")
+                return None
+            
+            room_data = room_info['data']['room_info']
+            is_live = room_data['live_status'] == 1
+            
+            return {
+                'is_live': is_live,
+                'room_info': room_data
+            }
+        except Exception as e:
+            logger.error(f"{self.plugin_msg}: 状态检查异常 {e}", exc_info=True)
+            return None
+
+    async def _monitor_live_status(self, room_id: str):
+        """
+        监控直播状态的后台任务
+        """
+        logger.info(f"{self.plugin_msg}: 开始监控直播状态")
+        
+        while not self._should_stop_download:
+            try:
+                await asyncio.sleep(self.status_check_interval)
+                
+                # 检查直播状态
+                live_status = await self._check_live_status(room_id)
+                
+                if live_status is None:
+                    # API 调用失败，继续监控
+                    logger.warning(f"{self.plugin_msg}: 状态检查失败，继续监控")
+                    continue
+                
+                self._last_status_check = time.time()
+                
+                if not live_status['is_live']:
+                    self._offline_count += 1
+                    logger.warning(f"{self.plugin_msg}: 检测到直播已停止 ({self._offline_count}/{self.max_offline_count})")
+                    
+                    if self._offline_count >= self.max_offline_count:
+                        logger.info(f"{self.plugin_msg}: 连续 {self.max_offline_count} 次检测到直播停止，准备终止录制")
+                        self._should_stop_download = True
+                        # 通知下载器停止
+                        await self._signal_download_stop()
+                        break
+                else:
+                    # 直播恢复，重置计数器
+                    if self._offline_count > 0:
+                        logger.info(f"{self.plugin_msg}: 直播状态恢复正常")
+                        self._offline_count = 0
+                        
+            except asyncio.CancelledError:
+                logger.info(f"{self.plugin_msg}: 状态监控任务被取消")
+                break
+            except Exception as e:
+                logger.error(f"{self.plugin_msg}: 状态监控异常 {e}", exc_info=True)
+                # 出现异常时等待更长时间再重试
+                await asyncio.sleep(min(self.status_check_interval * 2, 120))
+
+    async def _signal_download_stop(self):
+        """
+        发送停止下载的信号
+        """
+        # 这里可以根据具体的下载器实现来添加停止信号
+        # 例如设置一个标志位，或者调用特定的停止方法
+        logger.info(f"{self.plugin_msg}: 发送停止录制信号")
+        
+        # 如果有弹幕客户端，也要停止
+        if hasattr(self, 'danmaku') and self.danmaku:
+            try:
+                await self.danmaku.stop()
+            except Exception as e:
+                logger.error(f"{self.plugin_msg}: 停止弹幕客户端失败 {e}")
+
+    def should_stop_download(self) -> bool:
+        """
+        检查是否应该停止下载
+        :return: True 如果应该停止下载
+        """
+        return self._should_stop_download
+
+    async def acheck_url_healthy(self, url: str, timeout: int = 10) -> Optional[str]:
+        """
+        检查URL是否健康（重写父类方法以支持停止信号）
+        """
+        if self._should_stop_download:
+            logger.info(f"{self.plugin_msg}: 收到停止信号，取消URL健康检查")
+            return None
+            
+        # 调用原有的健康检查逻辑
+        try:
+            return await super().acheck_url_healthy(url, timeout)
+        except Exception as e:
+            if self._should_stop_download:
+                logger.info(f"{self.plugin_msg}: 下载已停止")
+                return None
+            raise
+
+    def cleanup(self):
+        """
+        清理资源
+        """
+        self._should_stop_download = True
+        if self._status_check_task and not self._status_check_task.done():
+            self._status_check_task.cancel()
+        
+        # 清理弹幕客户端
+        if hasattr(self, 'danmaku') and self.danmaku:
+            try:
+                # 这里需要根据DanmakuClient的实际API来调用
+                self.danmaku.close()
+            except Exception as e:
+                logger.error(f"{self.plugin_msg}: 清理弹幕客户端失败 {e}")
+
     def danmaku_init(self):
         if self.bilibili_danmaku:
             self.danmaku = DanmakuClient(
@@ -231,25 +366,17 @@ class Bililive(DownloadBase):
                 }
             )
 
-
     async def get_play_info(self, api: str, qn: int = 10000) -> dict:
         full_url = f"{api}/xlive/web-room/v2/index/getRoomPlayInfo"
         try:
             params = {
                 'room_id': str(self.__real_room_id),
-                # 'no_playurl': '0',
-                # 'mask': '1',
                 'qn': str(qn),
-                'platform': 'html5',  # 平台名称，web, html5, android, ios
-                'protocol': '0,1',  # 流协议，0: http_stream(flv), 1: http_hls
-                'format': '0,1,2',  # 编码格式，0: flv, 1: ts, 2: fmp4
-                'codec': '0',  # 编码器，0: avc, 1: hevc, 2: av1
-                # 'ptype': '8', # P2P配置，-1: disable, 8: WebRTC, 8192: MisakaTunnel
-                'dolby': '5', # 杜比格式，5: 杜比音频
-                # 'panorama': '1', # 全景(不支持 html5)
-                # 'hdr_type': '0,1', # HDR类型(不支持 html5)，0: SDR, 1: PQ
-                # 'req_reason': '0', # 请求原因，0: Normal, 1: PlayError
-                # 'http': '1', # 优先 http 协议
+                'platform': 'html5',
+                'protocol': '0,1',
+                'format': '0,1,2',
+                'codec': '0',
+                'dolby': '5',
                 'web_location': WBI_WEB_LOCATION,
             }
             wbi.sign(params)
@@ -272,12 +399,7 @@ class Bililive(DownloadBase):
         params = {
             "cid": self.__real_room_id,
             "mid": self.__login_mid,
-            "pt": "html5", # platform
-            # "p2p_type": "-1",
-            # "net": 0,
-            # "free_type": 0,
-            # "build": 0,
-            # "feature": 2 # 1:? 2:?
+            "pt": "html5",
         }
         try:
             m3u8_res = await client.get(
@@ -300,7 +422,6 @@ class Bililive(DownloadBase):
         for api in self.bili_api_list:
             play_info = await self.get_play_info(api, qn)
             if not play_info or check_areablock(play_info):
-                # logger.error(f"{self.plugin_msg}: {api} 返回内容错误: {play_info}")
                 continue
             streams = play_info['playurl_info']['playurl']['stream']
             if protocol == 'hls_fmp4':
@@ -311,12 +432,10 @@ class Bililive(DownloadBase):
                         stream_urls = await self.get_master_m3u8(api)
                         if stream_urls:
                             break
-                # 处理 API 信息
                 stream = streams[1] if len(streams) > 1 else streams[0]
                 for format in stream['format']:
                     if format['format_name'] == 'fmp4':
                         stream_urls = self.parse_stream_url(format['codec'][0])
-                        # fmp4 可能没有原画
                         if qn == 10000 and qn in stream_urls.keys():
                             break
                         else:
@@ -325,7 +444,6 @@ class Bililive(DownloadBase):
                 stream_urls = self.parse_stream_url(streams[0]['format'][0]['codec'][0])
             if stream_urls:
                 break
-        # 空字典照常返回，重试交给上层方法处理
         return stream_urls
 
     async def get_user_status(self) -> dict:
@@ -421,7 +539,6 @@ class Bililive(DownloadBase):
                     'suffix': match1(info['extra'], suffix_regexp)
                 })
             return streams
-
 
     def parse_master_m3u8(self, m3u8_content: str) -> dict:
         """
