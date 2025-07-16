@@ -26,6 +26,7 @@ dist/
 build/
 cover/
 cache/
+.cursor/
 
 *.back
 bili.cookie.json
@@ -43,3 +44,4 @@ data/
 .next
 out
 downloads/
+target
